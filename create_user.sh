@@ -1,87 +1,84 @@
-#!/bin/bash
-
-# Checking if the script is run as root
-if [ "$(id -u)" -ne 0 ]; then
-    echo "This script must be run as root" >&2
-    exit 1
-fi
-
-# Checking if a file was provided
-if [ -z "$1" ]; then
-    echo "Usage: $0 <filename>" >&2
-    exit 1
-fi
-
-# Defining log and secure file paths
-LOG_FILE="/var/log/user_management.log"
-SECURE_FILE="/var/secure/user_passwords.csv"
-
-# Creating  the secure directory 
-mkdir -p /var/secure
-
-# Creating the log and secure files
-> "$LOG_FILE"
-> "$SECURE_FILE"
-
-# Set secure file permissions
-chmod 600 "$SECURE_FILE"
-
-# Function to log messages
-log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+# Function to read and parse the input file
+read_input_file() {
+  local filename="$1"
+  while IFS=';' read -r user groups; do
+    users+=("$(echo "$user" | xargs)")
+    group_list+=("$(echo "$groups" | tr -d '[:space:]')")
+  done < "$filename"
 }
 
-# Read the input file line by line
-while IFS=';' read -r user groups; do
-    # Trim whitespace
-    user=$(echo "$user" | xargs)
-    groups=$(echo "$groups" | xargs)
-    
-    if id "$user" &>/dev/null; then
-        log_message "User $user already exists."
-        continue
+# Function to create a user with its personal group
+create_user_with_group() {
+  local username="$1"
+  if id "$username" &>/dev/null; then
+    echo "User $username already exists." | tee -a "$log_file"
+  else
+    groupadd "$username"
+    useradd -m -g "$username" -s /bin/bash "$username"
+    echo "Created user $username with personal group $username." | tee -a "$log_file"
+  fi
+}
+
+# Function to set a password for the user
+set_user_password() {
+  local username="$1"
+  local password=$(openssl rand -base64 12)
+  echo "$username:$password" | chpasswd
+  echo "$username,$password" >> "$password_file"
+  echo "Password for $username set and stored." | tee -a "$log_file"
+}
+
+
+# Function to add user to additional groups
+add_user_to_groups() {
+  local username="$1"
+  IFS=',' read -r -a groups <<< "$2"
+  for group in "${groups[@]}"; do
+    if ! getent group "$group" &>/dev/null; then
+      groupadd "$group"
+      echo "Group $group created." | tee -a "$log_file"
     fi
+    usermod -aG "$group" "$username"
+    echo "Added $username to group $group." | tee -a "$log_file"
+  done
+}
 
-    # Create the user's personal group
-    if ! getent group "$user" &>/dev/null; then
-        groupadd "$user"
-        log_message "Group $user created."
-    fi
 
-    # Create the user with the personal group and home directory
-    useradd -m -g "$user" -s /bin/bash "$user"
-    log_message "User $user created with home directory /home/$user."
+# Check for input file argument
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $0 <input_file>"
+  exit 1
+fi
 
-    # Set up the additional groups
-    if [ -n "$groups" ]; then
-        IFS=',' read -r -a group_array <<< "$groups"
-        for group in "${group_array[@]}"; do
-            group=$(echo "$group" | xargs)
-            if ! getent group "$group" &>/dev/null; then
-                groupadd "$group"
-                log_message "Group $group created."
-            fi
-            usermod -aG "$group" "$user"
-            log_message "User $user added to group $group."
-        done
-    fi
+# Initialize variables
+input_file="$1"
+log_file="/var/log/user_management.log"
+password_file="/var/secure/user_passwords.txt"
+declare -a users
+declare -a group_list
 
-    # Generate a random password
-    password=$(openssl rand -base64 12)
-    echo "$user:$password" | chpasswd
-    log_message "Password set for user $user."
+# Create log and password files if they do not exist
+mkdir -p /var/log /var/secure
+touch "$log_file"
+touch "$password_file"
+chmod 600 "$password_file"
 
-    # Store the username and password in the secure file
-    echo "$user,$password" >> "$SECURE_FILE"
+# Read input file
+read_input_file "$input_file"
 
-    # Set permissions for the home directory
-    chmod 700 /home/"$user"
-    chown "$user":"$user" /home/"$user"
-    log_message "Permissions set for home directory of user $user."
-done < "$1"
+# Process each user
+for ((i = 0; i < ${#users[@]}; i++)); do
+  username="${users[i]}"
+  user_groups="${group_list[i]}"
 
-log_message "User creation completed."
+  if [[ "$username" == "" ]]; then
+    continue  # Skip empty usernames
+  fi
 
-echo "1. Users creation complete.
-2. Logs available at $LOG_FILE.
-3. Passwords are stored securely at $SECURE_FILE."
+  create_user_with_group "$username"
+  set_user_password "$username"
+  add_user_to_groups "$username" "$user_groups"
+done
+
+echo "User creation and group assignment completed." | tee -a "$log_file"
+
